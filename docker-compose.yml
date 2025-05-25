@@ -1,0 +1,224 @@
+version: '3.8'
+
+services:
+  # Redis for caching and session management
+  redis:
+    image: redis:7-alpine
+    container_name: visionary-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - visionary-network
+
+  # PostgreSQL for development (alternative to DynamoDB locally)
+  postgres:
+    image: postgres:15-alpine
+    container_name: visionary-postgres
+    environment:
+      POSTGRES_DB: visionary_dev
+      POSTGRES_USER: visionary
+      POSTGRES_PASSWORD: dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - visionary-network
+
+  # Qdrant vector database
+  qdrant:
+    image: qdrant/qdrant:v1.7.0
+    container_name: visionary-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: 6333
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    networks:
+      - visionary-network
+
+  # MinIO for S3-compatible storage (development)
+  minio:
+    image: minio/minio:latest
+    container_name: visionary-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    networks:
+      - visionary-network
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: visionary-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - visionary-network
+
+  # Grafana for metrics visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: visionary-grafana
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    networks:
+      - visionary-network
+
+  # Jaeger for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: visionary-jaeger
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+    environment:
+      COLLECTOR_OTLP_ENABLED: true
+    networks:
+      - visionary-network
+
+  # OCR Service (will be built from backend)
+  ocr-service:
+    build:
+      context: ./backend
+      dockerfile: services/ocr/Dockerfile
+    container_name: visionary-ocr
+    ports:
+      - "8001:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://visionary:dev_password@postgres:5432/visionary_dev
+      - QDRANT_URL=http://qdrant:6333
+      - LOG_LEVEL=DEBUG
+    volumes:
+      - ./backend:/app
+      - model_cache:/app/models
+    depends_on:
+      - redis
+      - postgres
+      - qdrant
+    networks:
+      - visionary-network
+    # Uncomment for GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # LLM Service (will be built from backend)
+  llm-service:
+    build:
+      context: ./backend
+      dockerfile: services/llm/Dockerfile
+    container_name: visionary-llm
+    ports:
+      - "8002:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://visionary:dev_password@postgres:5432/visionary_dev
+      - QDRANT_URL=http://qdrant:6333
+      - LOG_LEVEL=DEBUG
+    volumes:
+      - ./backend:/app
+      - model_cache:/app/models
+    depends_on:
+      - redis
+      - postgres
+      - qdrant
+    networks:
+      - visionary-network
+    # Uncomment for GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # API Gateway
+  api-gateway:
+    build:
+      context: ./backend
+      dockerfile: services/gateway/Dockerfile
+    container_name: visionary-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://visionary:dev_password@postgres:5432/visionary_dev
+      - OCR_SERVICE_URL=http://ocr-service:8000
+      - LLM_SERVICE_URL=http://llm-service:8000
+      - LOG_LEVEL=DEBUG
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - redis
+      - postgres
+      - ocr-service
+      - llm-service
+    networks:
+      - visionary-network
+
+  # Frontend Development Server
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: visionary-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NODE_ENV=development
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - api-gateway
+    networks:
+      - visionary-network
+
+volumes:
+  redis_data:
+  postgres_data:
+  qdrant_data:
+  minio_data:
+  prometheus_data:
+  grafana_data:
+  model_cache:
+
+networks:
+  visionary-network:
+    driver: bridge 
